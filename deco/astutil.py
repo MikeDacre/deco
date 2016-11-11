@@ -2,7 +2,13 @@ import ast
 from ast import NodeTransformer
 import sys
 
-def Call(func, args = None, kwargs = None):
+def unindent(source_lines):
+    for i, line in enumerate(source_lines):
+        source_lines[i] = line.lstrip()
+        if source_lines[i][:3] == "def":
+            break
+
+def Call(func, args=None, kwargs=None):
     if args is None:
         args = []
     if kwargs is None:
@@ -33,27 +39,35 @@ class SchedulerRewriter(NodeTransformer):
         return False
 
     @staticmethod
-    def subscript_name(node):
+    def top_level_name(node):
         if type(node) is ast.Name:
             return node.id
-        elif type(node) is ast.Subscript:
-            return SchedulerRewriter.subscript_name(node.value)
-        raise ValueError("Assignment attempted on something that is not index based")
+        elif type(node) is ast.Subscript or type(node) is ast.Attribute:
+            return SchedulerRewriter.top_level_name(node.value)
+        return None
 
     def is_concurrent_call(self, node):
         return type(node) is ast.Call and type(node.func) is ast.Name and node.func.id in self.concurrent_funcs
 
     def is_valid_assignment(self, node):
-        return type(node) is ast.Assign and self.is_concurrent_call(node.value)
+        if not (type(node) is ast.Assign and self.is_concurrent_call(node.value)):
+            return False
+        if len(node.targets) != 1:
+            raise ValueError("Concurrent assignment does not support multiple assignment targets")
+        if not type(node.targets[0]) is ast.Subscript:
+            raise ValueError("Concurrent assignment only valid for index based objects")
+        return True
 
     def encounter_call(self, call):
         self.encountered_funcs.add(call.func.id)
         for arg in call.args:
-            self.arguments.add(SchedulerRewriter.subscript_name(arg))
+            arg_name = SchedulerRewriter.top_level_name(arg)
+            if arg_name is not None:
+                self.arguments.add(arg_name)
 
     def generic_visit(self, node):
         super(NodeTransformer, self).generic_visit(node)
-        if hasattr(node, 'body'):
+        if hasattr(node, 'body') and type(node.body) is list:
             returns = [i for i, child in enumerate(node.body) if type(child) is ast.Return]
             if len(returns) > 0:
                 for wait in self.get_waits():
@@ -66,7 +80,7 @@ class SchedulerRewriter(NodeTransformer):
                     call = child.value
                     self.encounter_call(call)
                     name = child.targets[0].value
-                    self.arguments.add(SchedulerRewriter.subscript_name(name))
+                    self.arguments.add(SchedulerRewriter.top_level_name(name))
                     index = child.targets[0].slice.value
                     call.func = ast.Attribute(call.func, 'assign', ast.Load())
                     call.args = [ast.Tuple([name, index], ast.Load())] + call.args
